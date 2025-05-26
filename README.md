@@ -8,7 +8,7 @@ This system automates document intake, validation, and compliance notifications 
 
 ## Architecture Diagram
 
-![Architecture Diagram](blank1-diagram.jpeg)
+![Architecture Diagram](blank2-diagram.png)
 
 ---
 
