@@ -1,0 +1,218 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Enhanced event-driven document ingestion with validation tracking
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive compliance alerts
+
+Resources:
+  # IAM Role with permissions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EnhancedS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:GetObjectTagging
+                  - s3:PutObjectTagging
+                Resource: 
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-client-uploads"
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-client-uploads/*"
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-validated-docs"
+                  - !Sub "arn:aws:s3:::${AWS::StackName}-validated-docs/*"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ComplianceSNSTopic
+
+  # Lambda Function 
+  DocumentValidatorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-Validator"
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          from urllib.parse import unquote_plus
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              sns = boto3.client('sns')
+              
+              logger.info(f"Received event: {json.dumps(event)}")
+              
+              try:
+                  record = event['Records'][0]['s3']
+                  bucket = record['bucket']['name']
+                  key = unquote_plus(record['object']['key'])
+                  
+                  logger.info(f"Processing file: {key} from bucket: {bucket}")
+                  
+                  # Validate file extension
+                  if not key.lower().endswith(('.pdf', '.docx')):
+                      message = f"Invalid file type: {key}"
+                      logger.error(message)
+                      sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject="Document Validation Failed",
+                          Message=message
+                      )
+                      return {"status": "invalid"}
+                  
+                  target_bucket = os.environ['VALIDATED_BUCKET']
+                  copy_source = {'Bucket': bucket, 'Key': key}
+                  
+                  # Verify source object exists
+                  s3.head_object(Bucket=bucket, Key=key)
+                  logger.info(f"Source object confirmed: {bucket}/{key}")
+                  
+                  # Perform copy operation
+                  response = s3.copy_object(
+                      CopySource=copy_source,
+                      Bucket=target_bucket,
+                      Key=key,
+                      MetadataDirective='COPY'
+                  )
+                  logger.info(f"Copy response: {response}")
+                  
+                  # Verify copy was successful
+                  s3.head_object(Bucket=target_bucket, Key=key)
+                  logger.info(f"Successfully verified copy in {target_bucket}/{key}")
+                  
+                  # Add tags to document
+                  s3.put_object_tagging(
+                      Bucket=target_bucket,
+                      Key=key,
+                      Tagging={
+                          'TagSet': [
+                              {'Key': 'ValidationStatus', 'Value': 'Validated'},
+                              {'Key': 'SourceBucket', 'Value': bucket}
+                          ]
+                      }
+                  )
+                  
+                  # Send success notification
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject="Document Validation Successful",
+                      Message=f"Document {key} was successfully validated and copied to {target_bucket}"
+                  )
+                  
+                  return {
+                      "status": "success",
+                      "copied_to": f"{target_bucket}/{key}"
+                  }
+                  
+              except Exception as e:
+                  error_msg = f"Error processing document: {str(e)}"
+                  logger.error(error_msg)
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject="Document Processing Failed",
+                      Message=error_msg
+                  )
+                  return {
+                      "status": "error",
+                      "error": str(e)
+                  }
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ComplianceSNSTopic
+          VALIDATED_BUCKET: !Ref ValidatedDocumentsBucket
+
+  # S3 Bucket for uploads with event notifications
+  ClientUploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-client-uploads"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt DocumentValidatorLambda.Arn
+
+  # Validated documents bucket with versioning and lifecycle
+  ValidatedDocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-validated-docs"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: KeepAllVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+
+  # SNS Topic with email subscription
+  ComplianceSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Document Processing Alerts"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  # Lambda permission for S3
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt DocumentValidatorLambda.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-client-uploads"
+
+  # CloudWatch Log Group for Lambda
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${DocumentValidatorLambda}"
+      RetentionInDays: 7
+
+Outputs:
+  UploadBucketName:
+    Value: !Ref ClientUploadsBucket
+    Description: Name of the upload bucket
+
+  ValidatedBucketName:
+    Value: !Ref ValidatedDocumentsBucket
+    Description: Name of the validated documents bucket
+
+  LambdaFunctionName:
+    Value: !Ref DocumentValidatorLambda
+    Description: Name of the validation Lambda function
+
+  LambdaLogGroup:
+    Value: !Ref LambdaLogGroup
+    Description: CloudWatch Log Group for Lambda logs
+
+  SNSTopicARN:
+    Value: !Ref ComplianceSNSTopic
+    Description: ARN of the notification topic
